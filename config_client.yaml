@@ -1,0 +1,27 @@
+# Operation role: "client"
+role: "client"
+
+# Pre-Shared Key (PSK). Must match server.
+psk: "YourSuperSecretPasswordKey2026!"
+
+# FEC parameters (Data shards k, Parity shards m)
+# (4, 2) tolerates up to 33% random packet loss
+fec_k: 4
+fec_m: 2
+
+# FEC decode timeout (seconds). Increase for high-latency networks.
+# Default: 0.5
+fec_decode_timeout: 0.5
+
+# Logging level: "debug" | "info" (Compliance enforced: logging cannot be disabled)
+log_level: "info"
+
+# Local TCP ingress
+listen:
+  host: "127.0.0.1"
+  port: 1080
+
+# Remote UDP egress endpoint
+tunnel:
+  host: "my-server.ddns.net"
+  port: 9999

@@ -1,0 +1,12 @@
+services:
+  tunnel-agent:
+    build: .
+    container_name: tunnel-agent
+    restart: always
+    network_mode: "host"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro

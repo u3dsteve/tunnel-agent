@@ -1,0 +1,26 @@
+# Operation role: "server"
+role: "server"
+
+# Pre-Shared Key (PSK). Must match client.
+psk: "YourSuperSecretPasswordKey2026!"
+
+# FEC parameters (Must match client)
+fec_k: 4
+fec_m: 2
+
+# FEC decode timeout (seconds). Increase for high-latency networks.
+# Default: 0.5
+fec_decode_timeout: 0.5
+
+# Logging level: "debug" | "info"
+log_level: "info"
+
+# Inbound UDP tunnel endpoint
+tunnel:
+  host: "0.0.0.0"
+  port: 9999
+
+# Final TCP destination
+target:
+  host: "127.0.0.1"
+  port: 22
