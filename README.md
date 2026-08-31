@@ -323,14 +323,6 @@ sudo netfilter-persistent save
 
 ---
 
-## Version History
-
-| Version | Key Changes |
-| :--- | :--- |
-| v1.1.5 | 64-bit sequence number (no wrap-around); reorder buffer timeout (5s); DNS thread isolation; FEC timeout configurable |
-
----
-
 ## Troubleshooting
 
 ### Issue: FEC decode timeouts appear frequently in logs
