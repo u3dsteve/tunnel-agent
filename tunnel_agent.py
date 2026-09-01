@@ -175,7 +175,7 @@ class TrueFECEngine:
 
 # ==================== 3. Reorder Buffer ====================
 class ReorderBuffer:
-    def __init__(self, max_window=256, timeout=5.0):
+    def __init__(self, max_window=256, timeout=1.0): # Timeout reduced from 5.0 to 1.0 for better real-time TCP
         self.expected_seq = 0
         self.buffer = {}  # seq -> (cmd, payload, timestamp)
         self.max_window = max_window
@@ -251,7 +251,8 @@ FEC_HDR_SIZE = struct.calcsize(FEC_HDR_FMT)
 INNER_HDR_FMT = "!BII"   # [CMD (1B)] [Session ID (4B)] [Session Seq (4B)]
 INNER_HDR_SIZE = struct.calcsize(INNER_HDR_FMT)
 
-SAFE_SHARD_SIZE = 1200   # Prevent MTU fragmentation overflow (1200B * K)
+CMD_HEARTBEAT = 3        # Added: Keep-Alive heartbeat command
+SAFE_SHARD_SIZE = 1000   # Modified: Shrink to 1000 to prevent UDP MTU IP fragmentation drop
 
 class ForwardAgent(asyncio.DatagramProtocol):
     def __init__(self, config, tunnel_resolver: DynamicResolver = None):
@@ -271,12 +272,15 @@ class ForwardAgent(asyncio.DatagramProtocol):
         self.next_sid = 1
         self.gc_task = None
         self.dns_task = None
+        self.heartbeat_task = None
 
     def connection_made(self, transport):
         self.udp_transport = transport
         self.gc_task = asyncio.create_task(self.gc_loop())
-        if self.role == "client" and self.tunnel_resolver:
-            self.dns_task = asyncio.create_task(self.dns_refresh_loop())
+        if self.role == "client":
+            self.heartbeat_task = asyncio.create_task(self.heartbeat_loop())
+            if self.tunnel_resolver:
+                self.dns_task = asyncio.create_task(self.dns_refresh_loop())
 
     def send_via_tunnel(self, payload: bytes, target_addr=None):
         self.group_counter = (self.group_counter + 1) % 0xFFFFFFFF
@@ -331,10 +335,22 @@ class ForwardAgent(asyncio.DatagramProtocol):
         except Exception as e:
             logger.debug(f"FEC recovery execution error: {e}")
 
+    async def _drain_writer(self, writer):
+        """Asynchronously waits for OS write buffer to drain to prevent memory spikes"""
+        try:
+            await writer.drain()
+        except Exception:
+            pass
+
     def process_payload(self, payload: bytes, addr):
         if len(payload) < INNER_HDR_SIZE:
             return
         cmd, sid, seq = struct.unpack(INNER_HDR_FMT, payload[:INNER_HDR_SIZE])
+        
+        # Ignored silently to refresh Router NAT table
+        if cmd == CMD_HEARTBEAT:
+            return
+            
         content = payload[INNER_HDR_SIZE:]
         now = time.monotonic()
 
@@ -342,7 +358,7 @@ class ForwardAgent(asyncio.DatagramProtocol):
         if not sess and self.role == "server" and cmd == 1:
             sess = {
                 "writer": None,
-                "reorder": ReorderBuffer(),
+                "reorder": ReorderBuffer(timeout=1.0), # Reduced timeout
                 "pending": [],
                 "last_active": now,
                 "seq_out": 0,
@@ -361,7 +377,11 @@ class ForwardAgent(asyncio.DatagramProtocol):
                     sess["closed_remote"] = True
                 elif pkt_data:
                     if sess["writer"]:
-                        sess["writer"].write(pkt_data)
+                        try:
+                            sess["writer"].write(pkt_data)
+                            asyncio.create_task(self._drain_writer(sess["writer"]))
+                        except Exception:
+                            pass
                     else:
                         sess["pending"].append(pkt_data)
 
@@ -393,7 +413,10 @@ class ForwardAgent(asyncio.DatagramProtocol):
             sess["writer"] = writer
             
             for pkt in sess["pending"]:
-                writer.write(pkt)
+                try:
+                    writer.write(pkt)
+                except Exception:
+                    pass
             sess["pending"].clear()
 
             if sess.get("closed_remote"):
@@ -430,6 +453,18 @@ class ForwardAgent(asyncio.DatagramProtocol):
             elif writer:
                 await safe_close_writer(writer)
 
+    async def heartbeat_loop(self, interval: int = 20):
+        """Keep NAT UDP mappings alive from the client side."""
+        while True:
+            await asyncio.sleep(interval)
+            if self.current_server_addr:
+                try:
+                    # Empty heartbeat payload
+                    msg = struct.pack(INNER_HDR_FMT, CMD_HEARTBEAT, 0, 0)
+                    self.send_via_tunnel(msg, self.current_server_addr)
+                except Exception as e:
+                    logger.debug(f"Heartbeat send error: {e}")
+
     async def dns_refresh_loop(self, interval: int = 60):
         """Periodically polls DNS for potential Server IP changes (DDNS resilience)."""
         while True:
@@ -462,6 +497,9 @@ class ForwardAgent(asyncio.DatagramProtocol):
             self.gc_task.cancel()
         if self.dns_task:
             self.dns_task.cancel()
+        if self.heartbeat_task:
+            self.heartbeat_task.cancel()
+            
         sids = list(self.sessions.keys())
         for sid in sids:
             sess = self.sessions.pop(sid, None)
@@ -513,7 +551,7 @@ async def main():
             
             agent.sessions[sid] = {
                 "writer": writer,
-                "reorder": ReorderBuffer(),
+                "reorder": ReorderBuffer(timeout=1.0), # Reduced timeout
                 "pending": [],
                 "seq_out": 0,
                 "last_active": time.monotonic()
@@ -536,6 +574,8 @@ async def main():
                     
                     msg = struct.pack(INNER_HDR_FMT, 1, sid, seq_out) + data
                     agent.send_via_tunnel(msg)
+            except Exception:
+                pass # Suppress noisy ConnectionResetErrors when clients forcefully disconnect
             finally:
                 sess = agent.sessions.get(sid)
                 if sess:
