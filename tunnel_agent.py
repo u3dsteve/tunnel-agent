@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import os
 import signal
@@ -8,615 +9,459 @@ import sys
 import time
 import yaml
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from typing import Dict, Tuple, Optional, List
 
-# Configure logger instance
+# ==================== 0. System Initialization & Config ====================
 logger = logging.getLogger("tunnel_agent")
 
-# ==================== 0. System Utilities & Diagnostics ====================
 def setup_logging(level_setting: str):
-    """
-    Configures log level according to user preference:
-    - "調試" / "debug": Detailed debug logging
-    - Default: Standard operational logging (INFO minimum, compliance enforced)
-    """
-    level_str = str(level_setting).strip().lower()
+    """Enforce INFO minimum for operational compliance unless DEBUG is requested."""
+    level = logging.DEBUG if str(level_setting).lower() == "debug" else logging.INFO
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
-    
     logger.handlers.clear()
     logger.addHandler(handler)
-    
-    if level_str in ("debug", "調試"):
-        logger.setLevel(logging.DEBUG)
-    else:  # Default to INFO (off/disable option removed for security audit compliance)
-        logger.setLevel(logging.INFO)
+    logger.setLevel(level)
 
-def setup_memory_limit(limit_mb: int):
-    """
-    Memory limit enforcement delegated to container (Docker/K8s) or systemd runtime.
-    """
-    logger.info("Memory limit delegated to container/systemd runtime.")
+class MemoryTuner:
+    """Dynamic buffer scaling based on available memory limits."""
+    def __init__(self, mem_mb: int):
+        self.mem_mb = max(int(mem_mb), 128)
+        ratio = self.mem_mb / 512.0
+        self.max_streams = min(int(1024 * ratio), 8192)
+        self.tcp_buf_limit = min(int(1048576 * ratio), 4194304)
+        self.reorder_window_limit = 256
+        self.seen_seq_ttl = 30.0
+        self.seen_seq_limit = 5000
 
-async def safe_close_writer(writer: asyncio.StreamWriter | None):
-    """Gracefully closes a StreamWriter and waits for underlying socket cleanup."""
-    if not writer:
-        return
-    try:
-        writer.close()
-        await writer.wait_closed()
-    except Exception:
-        pass
-
-# ==================== 1. Dynamic DNS & Address Resolver ====================
-class DynamicResolver:
-    """
-    Handles asynchronous domain resolution with cached addresses.
-    Re-resolves DNS records automatically on startup, network disconnection, or sending errors.
-    """
-    def __init__(self, host: str, port: int, socktype=socket.SOCK_DGRAM):
-        self.host = host
-        self.port = port
-        self.socktype = socktype
-        self._cached_family = None
-        self._cached_sockaddr = None
-
-    async def get_address(self, force_refresh: bool = False):
-        if force_refresh or self._cached_sockaddr is None:
-            logger.debug(f"Resolving DNS for host {self.host}:{self.port}...")
-            try:
-                res = await asyncio.to_thread(socket.getaddrinfo, self.host, self.port, socket.AF_UNSPEC, self.socktype)
-                if not res:
-                    raise ValueError(f"DNS resolution empty for {self.host}")
-                family, _, _, _, sockaddr = res[0]
-                self._cached_family = family
-                self._cached_sockaddr = sockaddr
-                logger.info(f"DNS resolved successfully: {self.host} -> {sockaddr[0]}")
-            except Exception as e:
-                logger.error(f"Failed to resolve address for {self.host}:{self.port} - {e}")
-                if force_refresh and self._cached_sockaddr:
-                    logger.warning("Retaining legacy cached address due to DNS lookup failure.")
-                else:
-                    raise
-        return self._cached_family, self._cached_sockaddr
-
-    def invalidate(self):
-        """Invalidates the cached address to trigger a fresh DNS lookup on next attempt."""
-        logger.debug(f"Invalidating cached IP address for {self.host}")
-        self._cached_sockaddr = None
-
-# ==================== 2. GF(2^8) Gauss-Jordan FEC Engine ====================
-EXP_TABLE = [0] * 512
-LOG_TABLE = [0] * 256
-
-def _init_gf():
-    poly = 0x11D
-    x = 1
-    for i in range(255):
-        EXP_TABLE[i] = x
-        EXP_TABLE[i + 255] = x
-        LOG_TABLE[x] = i
-        x = (x << 1) ^ (poly if (x & 0x80) else 0)
-
-_init_gf()
-
-def gf_mul(a, b):
-    return 0 if a == 0 or b == 0 else EXP_TABLE[LOG_TABLE[a] + LOG_TABLE[b]]
-
-def gf_inv(a):
-    if a == 0:
-        raise ZeroDivisionError()
-    return EXP_TABLE[255 - LOG_TABLE[a]]
-
-def gf_mat_inv(mat, k):
-    """Computes matrix inverse in GF(2^8) using Gauss-Jordan elimination."""
-    aug = [row[:] + [1 if i == j else 0 for j in range(k)] for i, row in enumerate(mat)]
-    for i in range(k):
-        pivot = aug[i][i]
-        if pivot == 0:
-            for r in range(i + 1, k):
-                if aug[r][i] != 0:
-                    aug[i], aug[r] = aug[r], aug[i]
-                    pivot = aug[i][i]
-                    break
-        inv_p = gf_inv(pivot)
-        aug[i] = [gf_mul(x, inv_p) for x in aug[i]]
-        for r in range(k):
-            if r != i and aug[r][i] != 0:
-                factor = aug[r][i]
-                aug[r] = [aug[r][c] ^ gf_mul(aug[i][c], factor) for c in range(2 * k)]
-    return [row[k:] for row in aug]
-
-class TrueFECEngine:
-    def __init__(self, k=4, m=2):
-        self.k = k
-        self.m = m
-        self.full_matrix = []
-        for i in range(k):
-            self.full_matrix.append([1 if i == j else 0 for j in range(k)])
-        for i in range(m):
-            row = [gf_inv((i + 1) ^ (m + j + 1)) for j in range(k)]
-            self.full_matrix.append(row)
-
-    def encode(self, data: bytes) -> list[bytes]:
-        shard_len = (len(data) + self.k - 1) // self.k
-        padded = data.ljust(shard_len * self.k, b'\x00')
-        data_shards = [padded[i * shard_len:(i + 1) * shard_len] for i in range(self.k)]
-        
-        all_shards = list(data_shards)
-        for i in range(self.m):
-            p_shard = bytearray(shard_len)
-            row = self.full_matrix[self.k + i]
-            for j in range(self.k):
-                coef = row[j]
-                d = data_shards[j]
-                for idx in range(shard_len):
-                    p_shard[idx] ^= gf_mul(d[idx], coef)
-            all_shards.append(bytes(p_shard))
-        return all_shards
-
-    def decode(self, received_dict: dict, shard_len: int, orig_len: int) -> bytes:
-        recv_ids = sorted(list(received_dict.keys()))[:self.k]
-        sub_matrix = [self.full_matrix[sid] for sid in recv_ids]
-        inv_matrix = gf_mat_inv(sub_matrix, self.k)
-        
-        recovered_shards = []
-        for i in range(self.k):
-            rec_s = bytearray(shard_len)
-            inv_row = inv_matrix[i]
-            for j, sid in enumerate(recv_ids):
-                coef = inv_row[j]
-                s_data = received_dict[sid]
-                for idx in range(shard_len):
-                    rec_s[idx] ^= gf_mul(s_data[idx], coef)
-            recovered_shards.append(bytes(rec_s))
-            
-        assembled = b"".join(recovered_shards)
-        return assembled[:orig_len]
-
-# ==================== 3. Reorder Buffer ====================
-class ReorderBuffer:
-    def __init__(self, max_window=256, timeout=1.0): # Timeout reduced from 5.0 to 1.0 for better real-time TCP
-        self.expected_seq = 0
-        self.buffer = {}  # seq -> (cmd, payload, timestamp)
-        self.max_window = max_window
-        self.timeout = timeout
-
-    def push(self, seq: int, cmd: int, payload: bytes, now: float = None) -> list[tuple[int, bytes]]:
-        if now is None:
-            now = time.monotonic()
-
-        # Clean up expired gaps to prevent sequence deadlock and memory leaks
-        while self.buffer:
-            min_seq = min(self.buffer.keys())
-            _, _, ts = self.buffer[min_seq]
-            if now - ts > self.timeout:
-                self.expected_seq = min_seq
-                break
-            else:
-                break
-
-        if seq < self.expected_seq:
-            return []
-        if seq < self.expected_seq + self.max_window:
-            self.buffer[seq] = (cmd, payload, now)
-        
-        ready = []
-        while self.expected_seq in self.buffer:
-            cmd, payload, _ = self.buffer.pop(self.expected_seq)
-            ready.append((cmd, payload))
-            self.expected_seq += 1
-        return ready
-
-# ==================== 4. Crypto & Anti-Replay Engine ====================
+# ==================== 1. Crypto & Anti-Replay Engine ====================
 class SecureTunnelCrypto:
-    def __init__(self, psk: str):
-        import hashlib
-        self.aead = ChaCha20Poly1305(hashlib.sha256(psk.encode()).digest())
-        self.max_seen_seq = -1
+    def __init__(self, psk: str, tuner: MemoryTuner):
+        key = hashlib.sha256(psk.encode()).digest()
+        self.aead = ChaCha20Poly1305(key)
+        self.tuner = tuner
+        self.seen_sequences: Dict[int, float] = {}  # seq -> timestamp
 
     def encrypt(self, plain: bytes, seq: int) -> bytes:
         nonce = os.urandom(12)
+        ts = int(time.time())
         pad_len = os.urandom(1)[0] % 16
         padding = os.urandom(pad_len)
-        ts = int(time.time())
-        
-        # 64-bit sequence number (!IQB: uint32 ts, uint64 seq, uint8 pad_len)
-        meta = struct.pack("!IQB", ts, seq, pad_len)
-        return nonce + self.aead.encrypt(nonce, meta + padding + plain, None)
+        # Header: Timestamp(4B), Seq(8B), PadLen(1B)
+        header = struct.pack("!IQL", ts, seq, pad_len)
+        return nonce + self.aead.encrypt(nonce, header + padding + plain, None)
 
-    def decrypt(self, raw: bytes) -> bytes | None:
-        if len(raw) < 12 + 16 + 13:
+    def decrypt(self, raw: bytes) -> Optional[bytes]:
+        if len(raw) < 12 + 16 + 13: 
             return None
+            
         nonce, ciphertext = raw[:12], raw[12:]
         try:
             decrypted = self.aead.decrypt(nonce, ciphertext, None)
-            ts, seq, pad_len = struct.unpack("!IQB", decrypted[:13])
-            now_ts = int(time.time())
-            
-            if abs(now_ts - ts) > 15:
+            ts, seq, pad_len = struct.unpack("!IQL", decrypted[:13])
+            now = time.time()
+
+            # Timestamp tolerance check (30 seconds)
+            if abs(now - ts) > 30: 
                 return None
             
-            if seq <= self.max_seen_seq:
+            # Anti-replay: Use iteration instead of dict comprehension for GC stability
+            if seq in self.seen_sequences: 
                 return None
-            self.max_seen_seq = seq
+            self.seen_sequences[seq] = now
+            
+            if len(self.seen_sequences) > self.tuner.seen_seq_limit:
+                cutoff = now - self.tuner.seen_seq_ttl
+                expired = [s for s, t in self.seen_sequences.items() if t < cutoff]
+                for s in expired: 
+                    del self.seen_sequences[s]
                 
             return decrypted[13 + pad_len:]
         except Exception:
             return None
 
-# ==================== 5. Core Forward Agent ====================
-FEC_HDR_FMT = "!IBBBH"   # [Group ID (4B)] [Shard ID (1B)] [K (1B)] [M (1B)] [Payload Len (2B)]
-FEC_HDR_SIZE = struct.calcsize(FEC_HDR_FMT)
+# ==================== 2. FEC Engine (GF2^8 Gauss-Jordan) ====================
+EXP_TABLE = [0] * 512
+LOG_TABLE = [0] * 256
 
-INNER_HDR_FMT = "!BII"   # [CMD (1B)] [Session ID (4B)] [Session Seq (4B)]
-INNER_HDR_SIZE = struct.calcsize(INNER_HDR_FMT)
+def _init_gf():
+    poly, x = 0x11D, 1
+    for i in range(255):
+        EXP_TABLE[i] = EXP_TABLE[i+255] = x
+        LOG_TABLE[x] = i
+        x = (x << 1) ^ (poly if (x & 0x80) else 0)
+_init_gf()
 
-CMD_HEARTBEAT = 3        # Added: Keep-Alive heartbeat command
-SAFE_SHARD_SIZE = 1000   # Modified: Shrink to 1000 to prevent UDP MTU IP fragmentation drop
+def gf_mul(a, b): return 0 if a == 0 or b == 0 else EXP_TABLE[LOG_TABLE[a] + LOG_TABLE[b]]
+def gf_inv(a): return EXP_TABLE[255 - LOG_TABLE[a]]
+
+class OptimizedFECEngine:
+    def __init__(self, k, m):
+        self.k, self.m = k, m
+        self.matrix = [[1 if i == j else 0 for j in range(k)] for i in range(k)]
+        for i in range(m):
+            self.matrix.append([gf_inv((i + 1) ^ (m + j + 1)) for j in range(k)])
+
+    def encode(self, data: bytes) -> List[bytes]:
+        shard_len = (len(data) + self.k - 1) // self.k
+        padded = data.ljust(shard_len * self.k, b'\x00')
+        shards = [padded[i*shard_len : (i+1)*shard_len] for i in range(self.k)]
+        for i in range(self.m):
+            p_shard = bytearray(shard_len)
+            row = self.matrix[self.k + i]
+            for j in range(self.k):
+                coef, d = row[j], shards[j]
+                for idx in range(shard_len): 
+                    p_shard[idx] ^= gf_mul(d[idx], coef)
+            shards.append(bytes(p_shard))
+        return shards
+
+    def decode(self, received: dict, shard_len: int, orig_len: int) -> bytes:
+        # Fast-path: if all original data shards arrived, skip matrix inversion
+        if all(i in received for i in range(self.k)):
+            return b"".join(received[i] for i in range(self.k))[:orig_len]
+        
+        recv_ids = sorted(list(received.keys()))[:self.k]
+        sub_matrix = [self.matrix[sid] for sid in recv_ids]
+        inv_matrix = self._mat_inv(sub_matrix, self.k)
+        
+        recovered = []
+        for i in range(self.k):
+            rec_s = bytearray(shard_len)
+            inv_row = inv_matrix[i]
+            for j, sid in enumerate(recv_ids):
+                coef, s_data = inv_row[j], received[sid]
+                for idx in range(shard_len): 
+                    rec_s[idx] ^= gf_mul(s_data[idx], coef)
+            recovered.append(bytes(rec_s))
+        return b"".join(recovered)[:orig_len]
+
+    def _mat_inv(self, mat, k):
+        aug = [row[:] + [1 if i == j else 0 for j in range(k)] for i, row in enumerate(mat)]
+        for i in range(k):
+            pivot = aug[i][i]
+            if pivot == 0:
+                for r in range(i+1, k):
+                    if aug[r][i] != 0: 
+                        aug[i], aug[r] = aug[r], aug[i]
+                        pivot = aug[i][i]
+                        break
+            inv_p = gf_inv(pivot)
+            aug[i] = [gf_mul(x, inv_p) for x in aug[i]]
+            for r in range(k):
+                if r != i:
+                    f = aug[r][i]
+                    aug[r] = [aug[r][c] ^ gf_mul(aug[i][c], f) for c in range(2*k)]
+        return [row[k:] for row in aug]
+
+# ==================== 3. Core Forward Agent ====================
+FEC_HDR = "!IBBBH" 
+CMD_HDR = "!BII"   
+CMD_DATA, CMD_CLOSE, CMD_ACK, CMD_HEARTBEAT = 1, 2, 3, 4
 
 class ForwardAgent(asyncio.DatagramProtocol):
-    def __init__(self, config, tunnel_resolver: DynamicResolver = None):
+    def __init__(self, config: dict, tuner: MemoryTuner):
         self.config = config
-        self.role = config["role"]
-        self.crypto = SecureTunnelCrypto(config["psk"])
-        self.fec = TrueFECEngine(k=config.get("fec_k", 4), m=config.get("fec_m", 2))
-        self.fec_decode_timeout = float(config.get("fec_decode_timeout", 0.5))
-        self.tunnel_resolver = tunnel_resolver
-        self.current_server_addr = None  # Dynamic target IP for client mode
+        self.tuner = tuner
+        self.crypto = SecureTunnelCrypto(config["psk"], tuner)
         
-        self.udp_transport = None
-        self.sessions = {}       # sid -> sess_dict
-        self.fec_groups = {}     # group_id -> {shards: {}, created_at: float}
+        self.fec_k = int(config.get("fec_k", 4))
+        self.fec_m = int(config.get("fec_m", 2))
+        self.fec = OptimizedFECEngine(self.fec_k, self.fec_m)
+        
+        self.sessions = {}
+        self.fec_groups = {}
         self.tunnel_seq = 0
-        self.group_counter = 0
+        self.group_id = 0
+        self.transport = None
+        self.server_addr = None
+        self.bg_tasks = []
+        
         self.next_sid = 1
-        self.gc_task = None
-        self.dns_task = None
-        self.heartbeat_task = None
+        self._last_no_target_warning = 0.0  # Rate-limit cooldown timestamp
+
+    def get_next_sid(self) -> int:
+        """
+        Allocate a unique non-zero Session ID with collision avoidance.
+        Worst-case loop iterations are bounded by max_streams, not 2^32-1.
+        """
+        max_attempts = self.tuner.max_streams + 1
+        for _ in range(max_attempts):
+            sid = self.next_sid
+            self.next_sid = (self.next_sid + 1) & 0xFFFFFFFF
+            if self.next_sid == 0:
+                self.next_sid = 1
+            if sid not in self.sessions and sid != 0:
+                return sid
+        # Fallback: should never reach here under normal conditions
+        sid = self.next_sid
+        self.next_sid = (self.next_sid + 1) & 0xFFFFFFFF
+        if sid == 0:
+            sid = 1
+        return sid
 
     def connection_made(self, transport):
-        self.udp_transport = transport
-        self.gc_task = asyncio.create_task(self.gc_loop())
-        if self.role == "client":
-            self.heartbeat_task = asyncio.create_task(self.heartbeat_loop())
-            if self.tunnel_resolver:
-                self.dns_task = asyncio.create_task(self.dns_refresh_loop())
+        self.transport = transport
+        self.bg_tasks.append(asyncio.create_task(self.gc_loop()))
+        if self.config["role"] == "client":
+            self.bg_tasks.append(asyncio.create_task(self.heartbeat_loop()))
+            self.bg_tasks.append(asyncio.create_task(self.dns_refresh_loop()))
 
-    def send_via_tunnel(self, payload: bytes, target_addr=None):
-        self.group_counter = (self.group_counter + 1) % 0xFFFFFFFF
-        group_id = self.group_counter
+    def send_via_tunnel(self, payload: bytes, addr=None):
+        target = addr or self.server_addr
+        if not target: 
+            now = time.monotonic()
+            if now - self._last_no_target_warning > 5.0:
+                logger.warning("[Send] No target address available, dropping packet (suppressing for 5s).")
+                self._last_no_target_warning = now
+            else:
+                logger.debug("[Send] No target address available, dropping packet.")
+            return
+
+        self.group_id = (self.group_id + 1) % 0xFFFFFFFF
         shards = self.fec.encode(payload)
         
-        dest_addr = self.current_server_addr if self.role == "client" else target_addr
-        if self.role == "client" and not dest_addr:
-            logger.error("Drop packet: Dynamic Server IP unavailable.")
-            return
-
-        for shard_id, shard_data in enumerate(shards):
-            self.tunnel_seq += 1  # 64-bit sequence increment without modulo wrap
-            fec_hdr = struct.pack(FEC_HDR_FMT, group_id, shard_id, self.fec.k, self.fec.m, len(payload))
-            encrypted = self.crypto.encrypt(fec_hdr + shard_data, self.tunnel_seq)
-            
+        for i, shard in enumerate(shards):
+            self.tunnel_seq += 1
+            fec_head = struct.pack(FEC_HDR, self.group_id, i, self.fec_k, self.fec_m, len(payload))
+            enc = self.crypto.encrypt(fec_head + shard, self.tunnel_seq)
             try:
-                self.udp_transport.sendto(encrypted, dest_addr)
-            except OSError as e:
-                logger.error(f"UDP send error encountered: {e}")
-                if self.tunnel_resolver:
-                    self.tunnel_resolver.invalidate()
+                self.transport.sendto(enc, target)
+            except OSError:
+                pass # Silently drop on OS send buffer overflow
 
     def datagram_received(self, data, addr):
-        decrypted = self.crypto.decrypt(data)
-        if not decrypted or len(decrypted) < FEC_HDR_SIZE:
+        dec = self.crypto.decrypt(data)
+        if not dec or len(dec) < 9: 
             return
+        
+        gid, sid, k, m, olen = struct.unpack(FEC_HDR, dec[:9])
+        shard_data = dec[9:]
+        
+        if gid not in self.fec_groups:
+            self.fec_groups[gid] = {"shards": {}, "time": time.monotonic(), "k": k, "m": m, "olen": olen}
+        
+        g = self.fec_groups[gid]
+        g["shards"][sid] = shard_data
+        
+        if len(g["shards"]) >= k:
+            shards = g.pop("shards")
+            asyncio.create_task(self.decode_and_process(gid, shards, len(shard_data), olen, addr))
 
-        group_id, shard_id, k, m, orig_len = struct.unpack(FEC_HDR_FMT, decrypted[:FEC_HDR_SIZE])
-        shard_payload = decrypted[FEC_HDR_SIZE:]
-
-        if group_id not in self.fec_groups:
-            self.fec_groups[group_id] = {"shards": {}, "created_at": time.monotonic()}
-            
-        grp = self.fec_groups[group_id]
-        grp["shards"][shard_id] = shard_payload
-
-        if len(grp["shards"]) >= k:
-            shards = grp["shards"]
-            del self.fec_groups[group_id]
-            asyncio.create_task(self._decode_fec_group(group_id, shards, len(shard_payload), orig_len, addr))
-
-    async def _decode_fec_group(self, group_id: int, shards: dict, shard_len: int, orig_len: int, addr):
+    async def decode_and_process(self, gid, shards, slen, olen, addr):
+        """FEC decode execution bound by timeout to prevent CPU DoS."""
         try:
-            recovered = await asyncio.wait_for(
-                asyncio.to_thread(self.fec.decode, shards, shard_len, orig_len),
-                timeout=self.fec_decode_timeout
+            plain = await asyncio.wait_for(
+                asyncio.to_thread(self.fec.decode, shards, slen, olen),
+                timeout=0.5
             )
-            self.process_payload(recovered, addr)
+            self.process_inner_cmd(plain, addr)
         except asyncio.TimeoutError:
-            logger.warning(f"FEC decode timeout for group {group_id}, dropping")
+            logger.warning(f"[Security] FEC group {gid} decode timeout, dropping (DoS defense).")
         except Exception as e:
-            logger.debug(f"FEC recovery execution error: {e}")
+            logger.debug(f"[FEC] Decode failed: {e}")
 
-    async def _drain_writer(self, writer):
-        """Asynchronously waits for OS write buffer to drain to prevent memory spikes"""
-        try:
-            await writer.drain()
-        except Exception:
-            pass
-
-    def process_payload(self, payload: bytes, addr):
-        if len(payload) < INNER_HDR_SIZE:
-            return
-        cmd, sid, seq = struct.unpack(INNER_HDR_FMT, payload[:INNER_HDR_SIZE])
-        
-        # Ignored silently to refresh Router NAT table
-        if cmd == CMD_HEARTBEAT:
+    def process_inner_cmd(self, data, addr):
+        if len(data) < 9: 
             return
             
-        content = payload[INNER_HDR_SIZE:]
-        now = time.monotonic()
-
-        sess = self.sessions.get(sid)
-        if not sess and self.role == "server" and cmd == 1:
-            sess = {
-                "writer": None,
-                "reorder": ReorderBuffer(timeout=1.0), # Reduced timeout
-                "pending": [],
-                "last_active": now,
-                "seq_out": 0,
-                "closed_remote": False,
-                "addr": addr
-            }
-            self.sessions[sid] = sess
-            asyncio.create_task(self.start_target_conn(sid, addr))
-
-        if sess:
-            sess["last_active"] = now
-            ordered_packets = sess["reorder"].push(seq, cmd, content if cmd == 1 else b"", now)
-            
-            for pkt_cmd, pkt_data in ordered_packets:
-                if pkt_cmd == 2:
-                    sess["closed_remote"] = True
-                elif pkt_data:
-                    if sess["writer"]:
-                        try:
-                            sess["writer"].write(pkt_data)
-                            asyncio.create_task(self._drain_writer(sess["writer"]))
-                        except Exception:
-                            pass
-                    else:
-                        sess["pending"].append(pkt_data)
-
-            if sess.get("closed_remote"):
-                writer = sess.pop("writer", None)
-                if writer:
-                    asyncio.create_task(safe_close_writer(writer))
-                self.sessions.pop(sid, None)
-
-    async def start_target_conn(self, sid, client_addr):
-        target_cfg = self.config["target"]
-        writer = None
-        target_resolver = DynamicResolver(target_cfg["host"], target_cfg["port"], socket.SOCK_STREAM)
+        cmd, sid, seq = struct.unpack(CMD_HDR, data[:9])
+        pay = data[9:]
         
-        try:
-            try:
-                _, sockaddr = await target_resolver.get_address()
-                reader, writer = await asyncio.open_connection(sockaddr[0], sockaddr[1])
-            except (OSError, asyncio.TimeoutError) as err:
-                logger.warning(f"Connection failed to target. Re-resolving address: {err}")
-                _, sockaddr = await target_resolver.get_address(force_refresh=True)
-                reader, writer = await asyncio.open_connection(sockaddr[0], sockaddr[1])
+        if cmd == CMD_HEARTBEAT: 
+            return # Ignore internal heartbeat payloads
 
-            sess = self.sessions.get(sid)
-            if not sess:
-                await safe_close_writer(writer)
-                return
-
-            sess["writer"] = writer
+        if self.config["role"] == "server" and sid not in self.sessions and cmd == CMD_DATA:
+            asyncio.create_task(self.create_server_session(sid, addr))
             
-            for pkt in sess["pending"]:
+        if sid in self.sessions:
+            sess = self.sessions[sid]
+            sess["last_act"] = time.monotonic()
+            
+            if cmd == CMD_DATA:
+                self.push_to_reorder(sess, seq, pay)
+            elif cmd == CMD_CLOSE:
+                self.close_session(sid)
+
+    def push_to_reorder(self, sess, seq, data):
+        """Memory bound for out-of-order packets."""
+        buf = sess["buffer"]
+        if seq < sess["exp_seq"]: 
+            return
+        
+        # Hard limit boundary drop to prevent memory ballooning
+        if seq > sess["exp_seq"] + self.tuner.reorder_window_limit:
+            return
+
+        buf[seq] = data
+        while sess["exp_seq"] in buf:
+            chunk = buf.pop(sess["exp_seq"])
+            writer = sess.get("writer")
+            if writer and not writer.is_closing():
                 try:
-                    writer.write(pkt)
-                except Exception:
-                    pass
-            sess["pending"].clear()
-
-            if sess.get("closed_remote"):
-                await safe_close_writer(sess.pop("writer", None))
-                self.sessions.pop(sid, None)
-                return
-
-            max_chunk = (self.fec.k * SAFE_SHARD_SIZE) - INNER_HDR_SIZE
-            while True:
-                data = await reader.read(max_chunk)
-                if not data:
-                    break
-                
-                sess = self.sessions.get(sid)
-                if not sess:
-                    break
-                
-                sess["last_active"] = time.monotonic()
-                seq_out = sess["seq_out"]
-                sess["seq_out"] += 1
-                
-                msg = struct.pack(INNER_HDR_FMT, 1, sid, seq_out) + data
-                self.send_via_tunnel(msg, client_addr)
-        except Exception as e:
-            logger.debug(f"Target connection error for session {sid}: {e}")
-            target_resolver.invalidate()
-        finally:
-            sess = self.sessions.pop(sid, None)
-            if sess:
-                seq_out = sess.get("seq_out", 0)
-                msg = struct.pack(INNER_HDR_FMT, 2, sid, seq_out)
-                self.send_via_tunnel(msg, client_addr)
-                await safe_close_writer(sess.get("writer") or writer)
-            elif writer:
-                await safe_close_writer(writer)
-
-    async def heartbeat_loop(self, interval: int = 20):
-        """Keep NAT UDP mappings alive from the client side."""
-        while True:
-            await asyncio.sleep(interval)
-            if self.current_server_addr:
-                try:
-                    # Empty heartbeat payload
-                    msg = struct.pack(INNER_HDR_FMT, CMD_HEARTBEAT, 0, 0)
-                    self.send_via_tunnel(msg, self.current_server_addr)
+                    writer.write(chunk)
                 except Exception as e:
-                    logger.debug(f"Heartbeat send error: {e}")
-
-    async def dns_refresh_loop(self, interval: int = 60):
-        """Periodically polls DNS for potential Server IP changes (DDNS resilience)."""
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                _, sockaddr = await self.tunnel_resolver.get_address(force_refresh=True)
-                if self.current_server_addr != sockaddr:
-                    logger.info(f"DDNS IP Update detected: {self.current_server_addr} -> {sockaddr}")
-                    self.current_server_addr = sockaddr
-            except Exception as e:
-                logger.warning(f"Background DDNS refresh encountered an error: {e}")
+                    logger.debug(f"[TCP] Write error: {e}")
+                    self.close_session(sess.get("sid"))
+                    break
+            sess["exp_seq"] += 1
 
     async def gc_loop(self):
+        """Background garbage collection for leaks."""
         while True:
             await asyncio.sleep(5)
             now = time.monotonic()
             
-            stale_groups = [gid for gid, g in self.fec_groups.items() if now - g["created_at"] > 3.0]
-            for gid in stale_groups:
-                del self.fec_groups[gid]
-
-            stale_sids = [sid for sid, s in self.sessions.items() if now - s["last_active"] > 60.0]
-            for sid in stale_sids:
-                sess = self.sessions.pop(sid, None)
-                if sess and sess.get("writer"):
-                    asyncio.create_task(safe_close_writer(sess["writer"]))
-
-    async def close_all_sessions(self):
-        if self.gc_task:
-            self.gc_task.cancel()
-        if self.dns_task:
-            self.dns_task.cancel()
-        if self.heartbeat_task:
-            self.heartbeat_task.cancel()
+            # Clean expired FEC groups (3s TTL)
+            stale_fec = [gid for gid, g in self.fec_groups.items() if now - g["time"] > 3.0]
+            for gid in stale_fec: 
+                self.fec_groups.pop(gid, None)
             
-        sids = list(self.sessions.keys())
-        for sid in sids:
-            sess = self.sessions.pop(sid, None)
-            if sess and sess.get("writer"):
-                await safe_close_writer(sess["writer"])
+            # Clean expired idle Sessions (300s TTL)
+            stale_sess = [sid for sid, s in self.sessions.items() if now - s["last_act"] > 300.0]
+            for sid in stale_sess: 
+                logger.debug(f"[GC] Closing idle session {sid}")
+                self.close_session(sid)
 
-# ==================== 6. Entry Point & Signal Handling ====================
+    async def heartbeat_loop(self):
+        """Keep NAT mappings active."""
+        while True:
+            await asyncio.sleep(20)
+            if self.server_addr:
+                msg = struct.pack(CMD_HDR, CMD_HEARTBEAT, 0, 0)
+                self.send_via_tunnel(msg, self.server_addr)
+
+    async def dns_refresh_loop(self):
+        """Thread-isolated, multi-IP resilient DDNS updater."""
+        host = self.config["tunnel"]["host"]
+        port = int(self.config["tunnel"]["port"])
+        while True:
+            await asyncio.sleep(60)
+            try:
+                info = await asyncio.to_thread(socket.getaddrinfo, host, port, socket.AF_INET)
+                valid_ips = [item[4] for item in info]
+                
+                if self.server_addr not in valid_ips:
+                    self.server_addr = valid_ips[0] if valid_ips else None
+                    if self.server_addr:
+                        logger.info(f"[DDNS] Target IP updated/switched: {self.server_addr}")
+            except Exception as e:
+                logger.debug(f"[DDNS] Refresh failed: {e}")
+
+    async def create_server_session(self, sid, client_addr):
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.config["target"]["host"], int(self.config["target"]["port"])),
+                timeout=10.0
+            )
+            sess = {
+                "sid": sid, "writer": writer, "buffer": {}, "exp_seq": 0, 
+                "last_act": time.monotonic(), "addr": client_addr, "seq_out": 0
+            }
+            self.sessions[sid] = sess
+            asyncio.create_task(self.pipe_tcp_to_udp(sid, reader, client_addr))
+        except Exception as e:
+            logger.debug(f"[Server] Target connection failed: {e}")
+
+    async def pipe_tcp_to_udp(self, sid, reader, addr):
+        try:
+            while True:
+                data = await reader.read(1000)
+                if not data: 
+                    break
+                sess = self.sessions.get(sid)
+                if not sess: 
+                    break
+                
+                msg = struct.pack(CMD_HDR, CMD_DATA, sid, sess["seq_out"]) + data
+                self.send_via_tunnel(msg, addr)
+                sess["seq_out"] += 1
+                sess["last_act"] = time.monotonic()
+                await asyncio.sleep(0.001)  # Minimal pacing
+        except (ConnectionError, OSError):
+            pass # Client forcefully disconnected
+        finally:
+            self.close_session(sid)
+
+    def close_session(self, sid):
+        sess = self.sessions.pop(sid, None)
+        if sess:
+            writer = sess.get("writer")
+            if writer and not writer.is_closing(): 
+                try:
+                    writer.close()
+                except Exception: pass
+            
+            msg = struct.pack(CMD_HDR, CMD_CLOSE, sid, 0)
+            self.send_via_tunnel(msg, sess.get("addr"))
+
+    def stop(self):
+        for task in self.bg_tasks:
+            task.cancel()
+        for sid in list(self.sessions.keys()):
+            self.close_session(sid)
+        if self.transport:
+            self.transport.close()
+
+# ==================== 4. Application Entry Point ====================
 async def main():
-    config_file = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
-    with open(config_file, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-
-    setup_logging(cfg.get("log_level", "一般"))
-    setup_memory_limit(cfg.get("memory_limit_mb", 128))
-
+    if len(sys.argv) < 2: 
+        print("Usage: python tunnel_agent.py <config.yaml>")
+        sys.exit(1)
+        
+    with open(sys.argv[1], "r") as f: 
+        config = yaml.safe_load(f)
+    
+    setup_logging(config.get("log_level", "info"))
+    tuner = MemoryTuner(config.get("available_memory_mb", 512))
     loop = asyncio.get_running_loop()
+    agent = ForwardAgent(config, tuner)
+    
     stop_event = asyncio.Event()
-
-    def shutdown_handler():
-        logger.info("Shutdown signal received. Initiating graceful shutdown...")
+    def shutdown():
+        logger.info("[System] Shutting down...")
         stop_event.set()
-
+        
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, shutdown_handler)
-        except NotImplementedError:
-            pass
+            loop.add_signal_handler(sig, shutdown)
+        except NotImplementedError: pass # Ignore on Windows
 
-    if cfg["role"] == "client":
-        t_cfg, l_cfg = cfg["tunnel"], cfg["listen"]
-        tunnel_resolver = DynamicResolver(t_cfg["host"], t_cfg["port"], socket.SOCK_DGRAM)
-        agent = ForwardAgent(cfg, tunnel_resolver=tunnel_resolver)
+    if config["role"] == "client":
+        host, port = config["tunnel"]["host"], int(config["tunnel"]["port"])
+        info = await asyncio.to_thread(socket.getaddrinfo, host, port, socket.AF_INET)
+        agent.server_addr = info[0][4]
         
-        # Initial resolution to configure IP family and cache initial target address
-        family, remote_sockaddr = await tunnel_resolver.get_address(force_refresh=True)
-        agent.current_server_addr = remote_sockaddr
-        
-        # Bind locally without fixing remote_addr to allow seamless DDNS IP switching
-        bind_ip = "::" if family == socket.AF_INET6 else "0.0.0.0"
-        transport, _ = await loop.create_datagram_endpoint(
-            lambda: agent,
-            local_addr=(bind_ip, 0),
-            family=family
-        )
-        
-        async def handle_client_tcp(reader, writer):
-            sid = agent.next_sid
-            agent.next_sid = (agent.next_sid + 1) % 0xFFFFFFFF
-            
+        async def handle_client(reader, writer):
+            sid = agent.get_next_sid()
             agent.sessions[sid] = {
-                "writer": writer,
-                "reorder": ReorderBuffer(timeout=1.0), # Reduced timeout
-                "pending": [],
-                "seq_out": 0,
-                "last_active": time.monotonic()
+                "sid": sid, "writer": writer, "buffer": {}, "exp_seq": 0, 
+                "last_act": time.monotonic(), "seq_out": 0
             }
+            await agent.pipe_tcp_to_udp(sid, reader, agent.server_addr)
             
-            max_chunk = (agent.fec.k * SAFE_SHARD_SIZE) - INNER_HDR_SIZE
-            try:
-                while True:
-                    data = await reader.read(max_chunk)
-                    if not data:
-                        break
-                    
-                    sess = agent.sessions.get(sid)
-                    if not sess:
-                        break
-                    
-                    sess["last_active"] = time.monotonic()
-                    seq_out = sess["seq_out"]
-                    sess["seq_out"] += 1
-                    
-                    msg = struct.pack(INNER_HDR_FMT, 1, sid, seq_out) + data
-                    agent.send_via_tunnel(msg)
-            except Exception:
-                pass # Suppress noisy ConnectionResetErrors when clients forcefully disconnect
-            finally:
-                sess = agent.sessions.get(sid)
-                if sess:
-                    seq_out = sess["seq_out"]
-                    msg = struct.pack(INNER_HDR_FMT, 2, sid, seq_out)
-                    agent.send_via_tunnel(msg)
-                    agent.sessions.pop(sid, None)
-                await safe_close_writer(writer)
-
-        listen_resolver = DynamicResolver(l_cfg["host"], l_cfg["port"], socket.SOCK_STREAM)
-        _, listen_sockaddr = await listen_resolver.get_address(force_refresh=True)
+        listen_host, listen_port = config["listen"]["host"], int(config["listen"]["port"])
+        server = await asyncio.start_server(handle_client, listen_host, listen_port)
         
-        server = await asyncio.start_server(handle_client_tcp, listen_sockaddr[0], listen_sockaddr[1])
-        logger.info(f"[Client Agent] Listening on TCP {l_cfg['host']}:{l_cfg['port']} -> Tunnel UDP {t_cfg['host']}:{t_cfg['port']}")
+        await loop.create_datagram_endpoint(lambda: agent, local_addr=("0.0.0.0", 0))
+        logger.info(f"[Client] Listening on {listen_host}:{listen_port} -> Tunneling to {host}:{port}")
         
-        async with server:
+        async with server: 
             await stop_event.wait()
             
-        transport.close()
-        await agent.close_all_sessions()
     else:
-        t_cfg = cfg["tunnel"]
-        tunnel_resolver = DynamicResolver(t_cfg["host"], t_cfg["port"], socket.SOCK_DGRAM)
-        agent = ForwardAgent(cfg, tunnel_resolver=tunnel_resolver)
-        
-        family, local_sockaddr = await tunnel_resolver.get_address(force_refresh=True)
-        transport, _ = await loop.create_datagram_endpoint(
-            lambda: agent,
-            local_addr=local_sockaddr,
-            family=family
-        )
-        logger.info(f"[Server Agent] Listening on Tunnel UDP {t_cfg['host']}:{t_cfg['port']}...")
+        tunnel_host, tunnel_port = config["tunnel"]["host"], int(config["tunnel"]["port"])
+        await loop.create_datagram_endpoint(lambda: agent, local_addr=(tunnel_host, tunnel_port))
+        logger.info(f"[Server] Tunnel listening securely on {tunnel_host}:{tunnel_port}")
         
         await stop_event.wait()
-        transport.close()
-        await agent.close_all_sessions()
-
-    logger.info("Agent stopped cleanly.")
+        
+    agent.stop()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        logger.critical(f"Fatal crash: {e}")
