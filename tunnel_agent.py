@@ -47,8 +47,8 @@ class SecureTunnelCrypto:
         ts = int(time.time())
         pad_len = os.urandom(1)[0] % 16
         padding = os.urandom(pad_len)
-        # Header: Timestamp(4B), Seq(8B), PadLen(1B)
-        header = struct.pack("!IQL", ts, seq, pad_len)
+        # Header: Timestamp(4B), Seq(8B), PadLen(1B) -> 13 Bytes total
+        header = struct.pack("!IQB", ts, seq, pad_len)
         return nonce + self.aead.encrypt(nonce, header + padding + plain, None)
 
     def decrypt(self, raw: bytes) -> Optional[bytes]:
@@ -58,23 +58,29 @@ class SecureTunnelCrypto:
         nonce, ciphertext = raw[:12], raw[12:]
         try:
             decrypted = self.aead.decrypt(nonce, ciphertext, None)
-            ts, seq, pad_len = struct.unpack("!IQL", decrypted[:13])
+            ts, seq, pad_len = struct.unpack("!IQB", decrypted[:13])
             now = time.time()
 
-            # Timestamp tolerance check (30 seconds)
-            if abs(now - ts) > 30: 
+            # Timestamp tolerance check (±15 seconds)
+            if abs(now - ts) > 15: 
                 return None
             
-            # Anti-replay: Use iteration instead of dict comprehension for GC stability
             if seq in self.seen_sequences: 
                 return None
             self.seen_sequences[seq] = now
             
+            # Fast FIFO cleanup on overflow to prevent O(N log N) sorting CPU spikes
             if len(self.seen_sequences) > self.tuner.seen_seq_limit:
                 cutoff = now - self.tuner.seen_seq_ttl
                 expired = [s for s, t in self.seen_sequences.items() if t < cutoff]
-                for s in expired: 
-                    del self.seen_sequences[s]
+                if expired:
+                    for s in expired: 
+                        del self.seen_sequences[s]
+                else:
+                    # Pop oldest 1000 items in O(1) time utilizing dict insertion order
+                    keys_to_pop = list(self.seen_sequences.keys())[:1000]
+                    for s in keys_to_pop:
+                        del self.seen_sequences[s]
                 
             return decrypted[13 + pad_len:]
         except Exception:
@@ -117,7 +123,6 @@ class OptimizedFECEngine:
         return shards
 
     def decode(self, received: dict, shard_len: int, orig_len: int) -> bytes:
-        # Fast-path: if all original data shards arrived, skip matrix inversion
         if all(i in received for i in range(self.k)):
             return b"".join(received[i] for i in range(self.k))[:orig_len]
         
@@ -167,6 +172,7 @@ class ForwardAgent(asyncio.DatagramProtocol):
         
         self.fec_k = int(config.get("fec_k", 4))
         self.fec_m = int(config.get("fec_m", 2))
+        self.fec_decode_timeout = float(config.get("fec_decode_timeout", 0.5))
         self.fec = OptimizedFECEngine(self.fec_k, self.fec_m)
         
         self.sessions = {}
@@ -178,13 +184,9 @@ class ForwardAgent(asyncio.DatagramProtocol):
         self.bg_tasks = []
         
         self.next_sid = 1
-        self._last_no_target_warning = 0.0  # Rate-limit cooldown timestamp
+        self._last_no_target_warning = 0.0
 
     def get_next_sid(self) -> int:
-        """
-        Allocate a unique non-zero Session ID with collision avoidance.
-        Worst-case loop iterations are bounded by max_streams, not 2^32-1.
-        """
         max_attempts = self.tuner.max_streams + 1
         for _ in range(max_attempts):
             sid = self.next_sid
@@ -193,7 +195,6 @@ class ForwardAgent(asyncio.DatagramProtocol):
                 self.next_sid = 1
             if sid not in self.sessions and sid != 0:
                 return sid
-        # Fallback: should never reach here under normal conditions
         sid = self.next_sid
         self.next_sid = (self.next_sid + 1) & 0xFFFFFFFF
         if sid == 0:
@@ -207,7 +208,8 @@ class ForwardAgent(asyncio.DatagramProtocol):
             self.bg_tasks.append(asyncio.create_task(self.heartbeat_loop()))
             self.bg_tasks.append(asyncio.create_task(self.dns_refresh_loop()))
 
-    def send_via_tunnel(self, payload: bytes, addr=None):
+    def send_via_tunnel(self, payload: bytes, addr=None) -> bool:
+        """Encapsulate payload into FEC shards and send. Returns False if OS socket buffer overflows."""
         target = addr or self.server_addr
         if not target: 
             now = time.monotonic()
@@ -216,19 +218,21 @@ class ForwardAgent(asyncio.DatagramProtocol):
                 self._last_no_target_warning = now
             else:
                 logger.debug("[Send] No target address available, dropping packet.")
-            return
+            return True
 
         self.group_id = (self.group_id + 1) % 0xFFFFFFFF
         shards = self.fec.encode(payload)
         
+        buffer_ok = True
         for i, shard in enumerate(shards):
-            self.tunnel_seq += 1
+            self.tunnel_seq = (self.tunnel_seq + 1) & 0xFFFFFFFFFFFFFFFF
             fec_head = struct.pack(FEC_HDR, self.group_id, i, self.fec_k, self.fec_m, len(payload))
             enc = self.crypto.encrypt(fec_head + shard, self.tunnel_seq)
             try:
                 self.transport.sendto(enc, target)
             except OSError:
-                pass # Silently drop on OS send buffer overflow
+                buffer_ok = False # OS socket send buffer full
+        return buffer_ok
 
     def datagram_received(self, data, addr):
         dec = self.crypto.decrypt(data)
@@ -239,21 +243,27 @@ class ForwardAgent(asyncio.DatagramProtocol):
         shard_data = dec[9:]
         
         if gid not in self.fec_groups:
-            self.fec_groups[gid] = {"shards": {}, "time": time.monotonic(), "k": k, "m": m, "olen": olen}
+            self.fec_groups[gid] = {
+                "shards": {}, "time": time.monotonic(), 
+                "k": k, "m": m, "olen": olen, "decoded": False
+            }
         
         g = self.fec_groups[gid]
+        if g.get("decoded"):
+            return
+
         g["shards"][sid] = shard_data
         
         if len(g["shards"]) >= k:
+            g["decoded"] = True
             shards = g.pop("shards")
             asyncio.create_task(self.decode_and_process(gid, shards, len(shard_data), olen, addr))
 
     async def decode_and_process(self, gid, shards, slen, olen, addr):
-        """FEC decode execution bound by timeout to prevent CPU DoS."""
         try:
             plain = await asyncio.wait_for(
                 asyncio.to_thread(self.fec.decode, shards, slen, olen),
-                timeout=0.5
+                timeout=self.fec_decode_timeout
             )
             self.process_inner_cmd(plain, addr)
         except asyncio.TimeoutError:
@@ -269,33 +279,68 @@ class ForwardAgent(asyncio.DatagramProtocol):
         pay = data[9:]
         
         if cmd == CMD_HEARTBEAT: 
-            return # Ignore internal heartbeat payloads
+            return
 
+        # Handle new incoming server session with tombstone protection against reconnect loops
         if self.config["role"] == "server" and sid not in self.sessions and cmd == CMD_DATA:
+            self.sessions[sid] = {
+                "sid": sid, "writer": None, "buffer": {}, "exp_seq": 0,
+                "last_act": time.monotonic(), "addr": addr, "seq_out": 0,
+                "connecting": True, "pending_pkts": [], "closed": False
+            }
             asyncio.create_task(self.create_server_session(sid, addr))
             
         if sid in self.sessions:
             sess = self.sessions[sid]
             sess["last_act"] = time.monotonic()
             
+            if sess.get("closed"):
+                return # Ignore trailing packets for closed sessions
+
             if cmd == CMD_DATA:
-                self.push_to_reorder(sess, seq, pay)
+                if sess.get("connecting"):
+                    if len(sess["pending_pkts"]) < self.tuner.reorder_window_limit:
+                        sess["pending_pkts"].append((seq, pay))
+                else:
+                    self.push_to_reorder(sess, seq, pay)
             elif cmd == CMD_CLOSE:
                 self.close_session(sid)
 
     def push_to_reorder(self, sess, seq, data):
-        """Memory bound for out-of-order packets."""
+        if sess.get("closed"):
+            return
+
         buf = sess["buffer"]
-        if seq < sess["exp_seq"]: 
+        exp = sess["exp_seq"]
+        
+        # Unsigned 32-bit modular arithmetic distance calculation
+        diff = (seq - exp) & 0xFFFFFFFF
+        
+        # Drop if sequence number is behind exp_seq (diff >= 2^31)
+        if diff >= 0x80000000:
             return
         
-        # Hard limit boundary drop to prevent memory ballooning
-        if seq > sess["exp_seq"] + self.tuner.reorder_window_limit:
+        # Drop if packet sequence exceeds reorder window limit
+        if diff > self.tuner.reorder_window_limit:
             return
 
         buf[seq] = data
+        now = time.monotonic()
+        if "gap_time" not in sess:
+            sess["gap_time"] = now
+
+        # Unblock stream stalls on unrecoverable packet gaps after 5 seconds timeout
+        if sess["exp_seq"] not in buf and (now - sess["gap_time"] > 5.0):
+            if buf:
+                # Find sequence number closest to exp_seq in modular space
+                closest_seq = min(buf.keys(), key=lambda s: (s - sess["exp_seq"]) & 0xFFFFFFFF)
+                sess["exp_seq"] = closest_seq
+                sess["gap_time"] = now
+                logger.warning(f"[Reorder] Gap timeout on session {sess['sid']}, skipping to seq {sess['exp_seq']}")
+
         while sess["exp_seq"] in buf:
             chunk = buf.pop(sess["exp_seq"])
+            sess["gap_time"] = time.monotonic()
             writer = sess.get("writer")
             if writer and not writer.is_closing():
                 try:
@@ -304,27 +349,27 @@ class ForwardAgent(asyncio.DatagramProtocol):
                     logger.debug(f"[TCP] Write error: {e}")
                     self.close_session(sess.get("sid"))
                     break
-            sess["exp_seq"] += 1
+            sess["exp_seq"] = (sess["exp_seq"] + 1) & 0xFFFFFFFF
 
     async def gc_loop(self):
-        """Background garbage collection for leaks."""
         while True:
             await asyncio.sleep(5)
             now = time.monotonic()
             
-            # Clean expired FEC groups (3s TTL)
             stale_fec = [gid for gid, g in self.fec_groups.items() if now - g["time"] > 3.0]
             for gid in stale_fec: 
                 self.fec_groups.pop(gid, None)
             
-            # Clean expired idle Sessions (300s TTL)
-            stale_sess = [sid for sid, s in self.sessions.items() if now - s["last_act"] > 300.0]
+            # Fast cleanup for closed sessions (30s) and long-idle sessions (300s)
+            stale_sess = [
+                sid for sid, s in self.sessions.items() 
+                if now - s["last_act"] > (30.0 if s.get("closed") else 300.0)
+            ]
             for sid in stale_sess: 
-                logger.debug(f"[GC] Closing idle session {sid}")
-                self.close_session(sid)
+                logger.debug(f"[GC] Removing session {sid}")
+                self.sessions.pop(sid, None)
 
     async def heartbeat_loop(self):
-        """Keep NAT mappings active."""
         while True:
             await asyncio.sleep(20)
             if self.server_addr:
@@ -332,7 +377,6 @@ class ForwardAgent(asyncio.DatagramProtocol):
                 self.send_via_tunnel(msg, self.server_addr)
 
     async def dns_refresh_loop(self):
-        """Thread-isolated, multi-IP resilient DDNS updater."""
         host = self.config["tunnel"]["host"]
         port = int(self.config["tunnel"]["port"])
         while True:
@@ -349,43 +393,61 @@ class ForwardAgent(asyncio.DatagramProtocol):
                 logger.debug(f"[DDNS] Refresh failed: {e}")
 
     async def create_server_session(self, sid, client_addr):
+        sess = self.sessions.get(sid)
+        if not sess or sess.get("closed"):
+            return
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(self.config["target"]["host"], int(self.config["target"]["port"])),
                 timeout=10.0
             )
-            sess = {
-                "sid": sid, "writer": writer, "buffer": {}, "exp_seq": 0, 
-                "last_act": time.monotonic(), "addr": client_addr, "seq_out": 0
-            }
-            self.sessions[sid] = sess
+            sess["writer"] = writer
+            sess["connecting"] = False
+            
+            pending = sess.pop("pending_pkts", [])
+            for p_seq, p_pay in pending:
+                self.push_to_reorder(sess, p_seq, p_pay)
+
             asyncio.create_task(self.pipe_tcp_to_udp(sid, reader, client_addr))
         except Exception as e:
             logger.debug(f"[Server] Target connection failed: {e}")
+            # Mark session closed with tombstone to suppress reconnection loops from trailing data
+            sess["closed"] = True
+            sess["connecting"] = False
+            sess.pop("pending_pkts", None)
+            msg = struct.pack(CMD_HDR, CMD_CLOSE, sid, 0)
+            self.send_via_tunnel(msg, client_addr)
 
     async def pipe_tcp_to_udp(self, sid, reader, addr):
         try:
             while True:
-                data = await reader.read(1000)
+                data = await reader.read(4096)
                 if not data: 
                     break
                 sess = self.sessions.get(sid)
-                if not sess: 
+                if not sess or sess.get("closed"): 
                     break
                 
                 msg = struct.pack(CMD_HDR, CMD_DATA, sid, sess["seq_out"]) + data
-                self.send_via_tunnel(msg, addr)
-                sess["seq_out"] += 1
+                sent_ok = self.send_via_tunnel(msg, addr)
+                sess["seq_out"] = (sess["seq_out"] + 1) & 0xFFFFFFFF
                 sess["last_act"] = time.monotonic()
-                await asyncio.sleep(0.001)  # Minimal pacing
+                
+                if not sent_ok:
+                    # Apply backpressure delay if OS UDP buffer overflows
+                    await asyncio.sleep(0.002)
+                else:
+                    # Cooperative yield to prevent event loop starvation under high TCP throughput
+                    await asyncio.sleep(0)
         except (ConnectionError, OSError):
-            pass # Client forcefully disconnected
+            pass
         finally:
             self.close_session(sid)
 
     def close_session(self, sid):
-        sess = self.sessions.pop(sid, None)
-        if sess:
+        sess = self.sessions.get(sid)
+        if sess and not sess.get("closed"):
+            sess["closed"] = True
             writer = sess.get("writer")
             if writer and not writer.is_closing(): 
                 try:
@@ -425,7 +487,7 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, shutdown)
-        except NotImplementedError: pass # Ignore on Windows
+        except (NotImplementedError, AttributeError): pass
 
     if config["role"] == "client":
         host, port = config["tunnel"]["host"], int(config["tunnel"]["port"])
@@ -436,7 +498,7 @@ async def main():
             sid = agent.get_next_sid()
             agent.sessions[sid] = {
                 "sid": sid, "writer": writer, "buffer": {}, "exp_seq": 0, 
-                "last_act": time.monotonic(), "seq_out": 0
+                "last_act": time.monotonic(), "seq_out": 0, "connecting": False, "closed": False
             }
             await agent.pipe_tcp_to_udp(sid, reader, agent.server_addr)
             
