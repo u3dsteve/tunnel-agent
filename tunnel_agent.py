@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import random
 import signal
 import socket
 import struct
@@ -14,6 +15,7 @@ from typing import Dict, Tuple, Optional, List, Any
 # ==================== 0. System Initialization & Config ====================
 logger = logging.getLogger("tunnel_agent")
 
+
 def setup_logging(level_setting: str):
     level = logging.DEBUG if str(level_setting).lower() == "debug" else logging.INFO
     handler = logging.StreamHandler(sys.stdout)
@@ -22,21 +24,34 @@ def setup_logging(level_setting: str):
     logger.addHandler(handler)
     logger.setLevel(level)
 
+
 def validate_config(config: dict):
-    required_top = ["role", "psk", "tunnel", "listen" if config.get("role") == "client" else "target"]
+    if not isinstance(config, dict):
+        raise ValueError("Config root must be a mapping")
+    if "role" not in config:
+        raise ValueError("Missing mandatory config field: role")
+    if config["role"] not in ("client", "server"):
+        raise ValueError(f"Invalid role: {config['role']}")
+
+    required_top = ["psk", "tunnel"]
+    required_top.append("listen" if config["role"] == "client" else "target")
     for field in required_top:
         if field not in config:
             raise ValueError(f"Missing mandatory config field: {field}")
-    if config["role"] not in ("client", "server"):
-        raise ValueError(f"Invalid role: {config['role']}")
-    if "host" not in config["tunnel"] or "port" not in config["tunnel"]:
-        raise ValueError("Tunnel host/port missing")
+
+    tunnel = config.get("tunnel")
+    if not isinstance(tunnel, dict) or "host" not in tunnel or "port" not in tunnel:
+        raise ValueError("Tunnel host/port missing or invalid")
+
     if config["role"] == "server":
-        if "target" not in config or "host" not in config["target"] or "port" not in config["target"]:
+        target = config.get("target")
+        if not isinstance(target, dict) or "host" not in target or "port" not in target:
             raise ValueError("Server target host/port missing")
     if config["role"] == "client":
-        if "listen" not in config or "host" not in config["listen"] or "port" not in config["listen"]:
+        listen = config.get("listen")
+        if not isinstance(listen, dict) or "host" not in listen or "port" not in listen:
             raise ValueError("Client listen host/port missing")
+
 
 class MemoryTuner:
     def __init__(self, mem_mb: int):
@@ -48,6 +63,7 @@ class MemoryTuner:
         self.seen_seq_ttl = 60.0
         self.seen_seq_limit = 10000
 
+
 # ==================== 1. Crypto & Anti-Replay Engine ====================
 class SecureTunnelCrypto:
     def __init__(self, psk: str, tuner: MemoryTuner, timestamp_tolerance: float = 60.0):
@@ -55,7 +71,7 @@ class SecureTunnelCrypto:
         self.aead = ChaCha20Poly1305(key)
         self.tuner = tuner
         self.timestamp_tolerance = timestamp_tolerance
-        self.seen_sequences: Dict[int, float] = {}
+        self.seen_sequences: Dict[Tuple[int, int], float] = {}
 
     def encrypt(self, plain: bytes, seq: int) -> bytes:
         nonce = os.urandom(12)
@@ -75,58 +91,69 @@ class SecureTunnelCrypto:
             now = time.time()
             if abs(now - ts) > self.timestamp_tolerance:
                 return None
-            if seq in self.seen_sequences:
-                return None
-            self.seen_sequences[seq] = now
 
-            # Cleanup logic
+            key = (ts, seq)
+            if key in self.seen_sequences:
+                return None
+            self.seen_sequences[key] = now
+
             if len(self.seen_sequences) > self.tuner.seen_seq_limit:
                 cutoff = now - self.timestamp_tolerance
-                expired = [s for s, t in self.seen_sequences.items() if t < cutoff]
-                for s in expired:
-                    del self.seen_sequences[s]
+                expired = [k for k, t in self.seen_sequences.items() if t < cutoff]
+                for k in expired:
+                    del self.seen_sequences[k]
                 if len(self.seen_sequences) > self.tuner.seen_seq_limit:
                     keys_to_pop = list(self.seen_sequences.keys())[:1000]
-                    for s in keys_to_pop:
-                        del self.seen_sequences[s]
+                    for k in keys_to_pop:
+                        del self.seen_sequences[k]
 
             return decrypted[13 + pad_len:]
         except Exception:
             return None
 
-# ==================== 2. FEC Engine (GF2^8 Gauss-Jordan) ====================
+
+# ==================== 2. FEC Engine ====================
 EXP_TABLE = [0] * 512
 LOG_TABLE = [0] * 256
+
 
 def _init_gf():
     poly, x = 0x11D, 1
     for i in range(255):
-        EXP_TABLE[i] = EXP_TABLE[i+255] = x
+        EXP_TABLE[i] = EXP_TABLE[i + 255] = x
         LOG_TABLE[x] = i
         x = (x << 1) ^ (poly if (x & 0x80) else 0)
+
+
 _init_gf()
 
-def gf_mul(a, b): return 0 if a == 0 or b == 0 else EXP_TABLE[LOG_TABLE[a] + LOG_TABLE[b]]
-def gf_inv(a): return EXP_TABLE[255 - LOG_TABLE[a]]
+
+def gf_mul(a, b):
+    return 0 if a == 0 or b == 0 else EXP_TABLE[LOG_TABLE[a] + LOG_TABLE[b]]
+
+
+def gf_inv(a):
+    if a == 0:
+        raise ZeroDivisionError("gf_inv(0)")
+    return EXP_TABLE[255 - LOG_TABLE[a]]
+
 
 class OptimizedFECEngine:
     def __init__(self, k, m):
         self.k, self.m = k, m
-        # Identity + Cauchy matrix
         self.matrix = [[1 if i == j else 0 for j in range(k)] for i in range(k)]
         for j in range(m):
             row = []
             y = k + j
             for i in range(k):
-                x = i
-                denominator = x ^ y
+                denominator = i ^ y
                 row.append(gf_inv(denominator))
             self.matrix.append(row)
 
     def encode(self, data: bytes) -> List[bytes]:
         shard_len = (len(data) + self.k - 1) // self.k
         padded = data.ljust(shard_len * self.k, b'\x00')
-        shards = [padded[i*shard_len : (i+1)*shard_len] for i in range(self.k)]
+        shards = [padded[i * shard_len: (i + 1) * shard_len] for i in range(self.k)]
         for i in range(self.m):
             p_shard = bytearray(shard_len)
             row = self.matrix[self.k + i]
@@ -138,6 +165,12 @@ class OptimizedFECEngine:
         return shards
 
     def decode(self, received: dict, shard_len: int, orig_len: int) -> bytes:
+        if len(received) < self.k:
+            raise ValueError(f"Not enough shards: {len(received)} < {self.k}")
+        for sid in received.keys():
+            if not (0 <= sid < self.k + self.m):
+                raise ValueError(f"Invalid shard id: {sid}")
+
         if all(i in received for i in range(self.k)):
             return b"".join(received[i] for i in range(self.k))[:orig_len]
 
@@ -161,23 +194,34 @@ class OptimizedFECEngine:
         for i in range(k):
             pivot = aug[i][i]
             if pivot == 0:
-                for r in range(i+1, k):
+                for r in range(i + 1, k):
                     if aug[r][i] != 0:
                         aug[i], aug[r] = aug[r], aug[i]
                         pivot = aug[i][i]
                         break
+                if pivot == 0:
+                    raise ValueError("Singular matrix in FEC decode")
             inv_p = gf_inv(pivot)
             aug[i] = [gf_mul(x, inv_p) for x in aug[i]]
             for r in range(k):
                 if r != i:
                     f = aug[r][i]
-                    aug[r] = [aug[r][c] ^ gf_mul(aug[i][c], f) for c in range(2*k)]
+                    aug[r] = [aug[r][c] ^ gf_mul(aug[i][c], f) for c in range(2 * k)]
         return [row[k:] for row in aug]
 
+
 # ==================== 3. Core Forward Agent ====================
-FEC_HDR = "!IBBBI"   # group_id(4), shard_id(1), k(1), m(1), original_len(4)
-CMD_HDR = "!BII"     # cmd(1), sid(4), seq(4)
+FEC_HDR = "!IBBBI"
+CMD_HDR = "!BII"
 CMD_DATA, CMD_CLOSE, CMD_ACK, CMD_HEARTBEAT = 1, 2, 3, 4
+
+FEC_ENCODE_INLINE_MAX = 2048
+FEC_DECODE_INLINE_MAX = 4096
+FEC_DECODED_KEEPALIVE = 30.0
+FEC_PENDING_TIMEOUT = 3.0
+SESSION_IDLE_TIMEOUT = 1800.0
+SEND_BUFFER_HARD_LIMIT = 8192
+
 
 class ForwardAgent(asyncio.DatagramProtocol):
     def __init__(self, config: dict, tuner: MemoryTuner):
@@ -186,25 +230,33 @@ class ForwardAgent(asyncio.DatagramProtocol):
         self.timestamp_tolerance = float(config.get("timestamp_tolerance", 60.0))
         self.crypto = SecureTunnelCrypto(config["psk"], tuner, self.timestamp_tolerance)
 
-        # FEC 参数可通过配置调整，默认 k=4, m=1 以减少计算量
         self.fec_k = int(config.get("fec_k", 4))
         self.fec_m = int(config.get("fec_m", 1))
-        self.fec_decode_timeout = float(config.get("fec_decode_timeout", 0.5))
+        if self.fec_k <= 0 or self.fec_m < 0 or self.fec_k + self.fec_m > 255:
+            raise ValueError(f"Invalid FEC parameters: k={self.fec_k}, m={self.fec_m}")
         self.fec = OptimizedFECEngine(self.fec_k, self.fec_m)
 
-        # 发送缓冲区设置
-        self.send_buffer_size = int(config.get("send_buffer_size", 65536))  # 64KB
-        self.send_timeout = float(config.get("send_timeout", 0.005))        # 5ms
+        raw_buf = int(config.get("send_buffer_size", 4096))
+        if raw_buf <= 0:
+            raw_buf = 4096
+        if raw_buf > SEND_BUFFER_HARD_LIMIT:
+            logger.warning(
+                f"[Config] send_buffer_size={raw_buf} exceeds hard limit, "
+                f"clamping to {SEND_BUFFER_HARD_LIMIT}"
+            )
+            raw_buf = SEND_BUFFER_HARD_LIMIT
+        self.send_buffer_size = raw_buf
+        self.send_timeout = float(config.get("send_timeout", 0.005))
 
         self.sessions = {}
         self.fec_groups = {}
         self.tunnel_seq = 0
         self.group_id = 0
-        self.transport = None
+        self.transport: Optional[asyncio.DatagramTransport] = None
         self.server_addr = None
-        self.bg_tasks = []
+        self.bg_tasks: List[asyncio.Task] = []
 
-        self.next_sid = 1
+        self.next_sid = random.randint(1, 0x7FFFFFFF)
         self._last_no_target_warning = 0.0
 
     def get_next_sid(self) -> int:
@@ -226,7 +278,13 @@ class ForwardAgent(asyncio.DatagramProtocol):
             self.bg_tasks.append(asyncio.create_task(self.dns_refresh_loop()))
 
     async def send_via_tunnel(self, payload: bytes, addr=None) -> bool:
-        """Encapsulate payload into FEC shards and send asynchronously."""
+        if self.transport is None or self.transport.is_closing():
+            return False
+
+        if len(payload) > (1 << 24):
+            logger.warning(f"[Send] Payload too large: {len(payload)}")
+            return False
+
         target = addr or self.server_addr
         if not target:
             now = time.monotonic()
@@ -235,19 +293,25 @@ class ForwardAgent(asyncio.DatagramProtocol):
                 self._last_no_target_warning = now
             return False
 
-        self.group_id = (self.group_id + 1) % 0xFFFFFFFF
-        # 将 FEC 编码放入线程池执行，避免阻塞事件循环
-        shards = await asyncio.to_thread(self.fec.encode, payload)
+        gid = self.group_id = (self.group_id + 1) % 0xFFFFFFFF
+
+        if len(payload) <= FEC_ENCODE_INLINE_MAX:
+            shards = self.fec.encode(payload)
+        else:
+            shards = await asyncio.to_thread(self.fec.encode, payload)
 
         buffer_ok = True
         for i, shard in enumerate(shards):
             self.tunnel_seq = (self.tunnel_seq + 1) & 0xFFFFFFFFFFFFFFFF
-            fec_head = struct.pack(FEC_HDR, self.group_id, i, self.fec_k, self.fec_m, len(payload))
-            # 加密也在线程池中执行，但为了简单，这里直接同步调用（加密开销相对较小）
+            fec_head = struct.pack(FEC_HDR, gid, i, self.fec_k, self.fec_m, len(payload))
             enc = self.crypto.encrypt(fec_head + shard, self.tunnel_seq)
             try:
                 self.transport.sendto(enc, target)
-            except OSError:
+            except (OSError, RuntimeError):
+                # [FIX-7-3] RuntimeError can be raised by asyncio transports when
+                # the transport was closed between the is_closing() check above
+                # and this sendto() call. Catch it so a shutdown race does not
+                # crash the calling coroutine.
                 buffer_ok = False
         return buffer_ok
 
@@ -257,6 +321,14 @@ class ForwardAgent(asyncio.DatagramProtocol):
             return
 
         gid, sid, k, m, olen = struct.unpack(FEC_HDR, dec[:struct.calcsize(FEC_HDR)])
+
+        if k != self.fec_k or m != self.fec_m:
+            return
+        if sid >= k + m:
+            return
+        if olen > (1 << 24):
+            return
+
         shard_data = dec[struct.calcsize(FEC_HDR):]
 
         g = self.fec_groups.get(gid)
@@ -274,21 +346,22 @@ class ForwardAgent(asyncio.DatagramProtocol):
 
         if len(g["shards"]) >= k:
             g["decoded"] = True
-            shards = g.pop("shards")
-            self.fec_groups.pop(gid, None)
-            asyncio.create_task(self.decode_and_process(gid, shards, len(shard_data), olen, addr))
+            g["time"] = time.monotonic()
+            shards_snapshot = dict(g["shards"])
+            g["shards"] = {}
+            asyncio.create_task(
+                self.decode_and_process(gid, shards_snapshot, len(shard_data), olen, addr)
+            )
 
     async def decode_and_process(self, gid, shards, slen, olen, addr):
         try:
-            plain = await asyncio.wait_for(
-                asyncio.to_thread(self.fec.decode, shards, slen, olen),
-                timeout=self.fec_decode_timeout
-            )
+            if slen * self.fec_k <= FEC_DECODE_INLINE_MAX:
+                plain = self.fec.decode(shards, slen, olen)
+            else:
+                plain = await asyncio.to_thread(self.fec.decode, shards, slen, olen)
             self.process_inner_cmd(plain, addr)
-        except asyncio.TimeoutError:
-            logger.warning(f"[Security] FEC group {gid} decode timeout, dropping.")
         except Exception as e:
-            logger.debug(f"[FEC] Decode failed: {e}")
+            logger.debug(f"[FEC] Decode failed for group {gid}: {e}")
 
     def process_inner_cmd(self, data, addr):
         if len(data) < struct.calcsize(CMD_HDR):
@@ -298,15 +371,67 @@ class ForwardAgent(asyncio.DatagramProtocol):
         pay = data[struct.calcsize(CMD_HDR):]
 
         if cmd == CMD_HEARTBEAT:
+            # [FIX-7-2] Refresh only sessions whose stored peer address matches
+            # the heartbeat sender. The previous version refreshed ALL sessions,
+            # so one live client's heartbeat could keep dead clients' sessions
+            # alive indefinitely and prevent GC from reclaiming them.
+            if self.config["role"] == "server":
+                now = time.monotonic()
+                for sess in self.sessions.values():
+                    if sess["addr"] == addr:
+                        sess["last_act"] = now
             return
 
-        if self.config["role"] == "server" and sid not in self.sessions and cmd == CMD_DATA:
-            self.sessions[sid] = {
-                "sid": sid, "writer": None, "buffer": {}, "exp_seq": 0,
-                "last_act": time.monotonic(), "addr": addr, "seq_out": 0,
-                "connecting": True, "pending_pkts": [], "closed": False
-            }
-            asyncio.create_task(self.create_server_session(sid, addr))
+        if self.config["role"] == "server" and cmd == CMD_DATA and sid != 0:
+            existing = self.sessions.get(sid)
+
+            if existing is not None and seq == 0:
+                logger.warning(
+                    f"[Server] sid={sid} re-handshake from {addr} (old={existing['addr']}), resetting."
+                )
+                existing["closed"] = True
+                w = existing.get("writer")
+                if w and not w.is_closing():
+                    try:
+                        w.close()
+                    except Exception:
+                        pass
+                self.sessions.pop(sid, None)
+                existing = None
+
+            elif existing is not None and existing["addr"] != addr:
+                # [FIX-7-1] Different source IP means a different physical client.
+                # We must NOT silently retarget the existing session to the new
+                # peer, or return traffic could be routed to the wrong client's
+                # TCP connection. Same IP + different port is the NAT-rebinding
+                # case and we continue to follow the address.
+                if existing["addr"][0] != addr[0]:
+                    logger.warning(
+                        f"[Server] sid={sid} collision across IPs "
+                        f"({existing['addr']} vs {addr}), resetting session."
+                    )
+                    existing["closed"] = True
+                    w = existing.get("writer")
+                    if w and not w.is_closing():
+                        try:
+                            w.close()
+                        except Exception:
+                            pass
+                    self.sessions.pop(sid, None)
+                    existing = None
+                else:
+                    logger.debug(
+                        f"[Server] sid={sid} peer addr changed: {existing['addr']} -> {addr}"
+                    )
+                    existing["addr"] = addr
+
+            if existing is None:
+                self.sessions[sid] = {
+                    "sid": sid, "writer": None, "buffer": {}, "exp_seq": seq,
+                    "last_act": time.monotonic(), "addr": addr, "seq_out": 0,
+                    "connecting": True, "pending_pkts": [], "closed": False
+                }
+                asyncio.create_task(self.create_server_session(sid, addr))
 
         if sid in self.sessions:
             sess = self.sessions[sid]
@@ -340,7 +465,6 @@ class ForwardAgent(asyncio.DatagramProtocol):
         if "gap_time" not in sess:
             sess["gap_time"] = now
 
-        # 简单处理：如果超过5秒未收到期望包，则跳过空洞
         if sess["exp_seq"] not in buf and (now - sess["gap_time"] > 5.0):
             if buf:
                 closest_seq = min(buf.keys(), key=lambda s: (s - sess["exp_seq"]) & 0xFFFFFFFF)
@@ -354,7 +478,8 @@ class ForwardAgent(asyncio.DatagramProtocol):
             writer = sess.get("writer")
             if writer and not writer.is_closing():
                 try:
-                    writer.write(chunk)
+                    if chunk:
+                        writer.write(chunk)
                 except Exception as e:
                     logger.debug(f"[TCP] Write error: {e}")
                     asyncio.create_task(self.close_session(sess.get("sid")))
@@ -366,13 +491,19 @@ class ForwardAgent(asyncio.DatagramProtocol):
             await asyncio.sleep(5)
             now = time.monotonic()
 
-            stale_fec = [gid for gid, g in self.fec_groups.items() if now - g["time"] > 3.0]
+            stale_fec = []
+            for gid, g in self.fec_groups.items():
+                age = now - g["time"]
+                if g["decoded"] and age > FEC_DECODED_KEEPALIVE:
+                    stale_fec.append(gid)
+                elif not g["decoded"] and age > FEC_PENDING_TIMEOUT:
+                    stale_fec.append(gid)
             for gid in stale_fec:
                 self.fec_groups.pop(gid, None)
 
             stale_sess = [
                 sid for sid, s in self.sessions.items()
-                if now - s["last_act"] > (30.0 if s.get("closed") else 300.0)
+                if now - s["last_act"] > (30.0 if s.get("closed") else SESSION_IDLE_TIMEOUT)
             ]
             for sid in stale_sess:
                 sess = self.sessions.get(sid)
@@ -417,6 +548,10 @@ class ForwardAgent(asyncio.DatagramProtocol):
                 asyncio.open_connection(self.config["target"]["host"], int(self.config["target"]["port"])),
                 timeout=10.0
             )
+            if sess.get("closed"):
+                writer.close()
+                return
+
             sess["writer"] = writer
             sess["connecting"] = False
 
@@ -434,46 +569,52 @@ class ForwardAgent(asyncio.DatagramProtocol):
             await self.send_via_tunnel(msg, client_addr)
 
     async def pipe_tcp_to_udp(self, sid, reader, addr):
-        """TCP → UDP 转发，带发送缓冲区以减少小包数量"""
         consecutive_failures = 0
         send_buffer = bytearray()
         last_send_time = time.monotonic()
+        max_payload = max(self.send_buffer_size, 512)
 
         async def flush_buffer():
             nonlocal send_buffer, last_send_time
             if not send_buffer:
-                return
-            data = bytes(send_buffer)
-            send_buffer.clear()
-            last_send_time = time.monotonic()
+                return True
 
             sess = self.sessions.get(sid)
             if not sess or sess.get("closed"):
-                return
+                return False
 
-            msg = struct.pack(CMD_HDR, CMD_DATA, sid, sess["seq_out"]) + data
-            sent_ok = await self.send_via_tunnel(msg, addr)
+            target_addr = sess.get("addr") or addr
+
+            chunk = bytes(send_buffer[:max_payload])
+            msg = struct.pack(CMD_HDR, CMD_DATA, sid, sess["seq_out"]) + chunk
+            sent_ok = await self.send_via_tunnel(msg, target_addr)
+            if not sent_ok:
+                return False
+
+            del send_buffer[:len(chunk)]
+            last_send_time = time.monotonic()
             sess["seq_out"] = (sess["seq_out"] + 1) & 0xFFFFFFFF
             sess["last_act"] = time.monotonic()
-            return sent_ok
+            return True
 
         try:
             while True:
-                data = await reader.read(32768)  # 大块读取
-                if not data:
-                    break
+                try:
+                    data = await asyncio.wait_for(reader.read(32768), timeout=self.send_timeout)
+                    if not data:
+                        break
+                    send_buffer.extend(data)
+                except asyncio.TimeoutError:
+                    pass
 
-                sess = self.sessions.get(sid)
-                if not sess or sess.get("closed"):
-                    break
-
-                send_buffer.extend(data)
-
-                # 达到阈值或超时则发送
                 if len(send_buffer) >= self.send_buffer_size or \
-                   (time.monotonic() - last_send_time) >= self.send_timeout:
+                        (send_buffer and (time.monotonic() - last_send_time) >= self.send_timeout):
                     sent_ok = await flush_buffer()
                     if not sent_ok:
+                        sess_check = self.sessions.get(sid)
+                        if not sess_check or sess_check.get("closed"):
+                            logger.debug(f"[Pipe] Session {sid} gone, exiting.")
+                            break
                         consecutive_failures += 1
                         delay = min(0.002 * (2 ** min(consecutive_failures, 6)), 0.1)
                         await asyncio.sleep(delay)
@@ -482,14 +623,15 @@ class ForwardAgent(asyncio.DatagramProtocol):
                             break
                     else:
                         consecutive_failures = 0
-                    await asyncio.sleep(0)   # yield
+                    await asyncio.sleep(0)
 
-            # 循环结束后发送剩余数据
             if send_buffer:
                 await flush_buffer()
 
         except (ConnectionError, OSError):
             pass
+        except asyncio.CancelledError:
+            raise
         finally:
             await self.close_session(sid)
 
@@ -501,6 +643,7 @@ class ForwardAgent(asyncio.DatagramProtocol):
             if writer and not writer.is_closing():
                 try:
                     writer.close()
+                    await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
                 except Exception:
                     pass
             msg = struct.pack(CMD_HDR, CMD_CLOSE, sid, 0)
@@ -513,6 +656,7 @@ class ForwardAgent(asyncio.DatagramProtocol):
             asyncio.create_task(self.close_session(sid))
         if self.transport:
             self.transport.close()
+
 
 # ==================== 4. Application Entry Point ====================
 async def main():
@@ -530,6 +674,7 @@ async def main():
     agent = ForwardAgent(config, tuner)
 
     stop_event = asyncio.Event()
+
     def shutdown():
         logger.info("[System] Shutting down...")
         stop_event.set()
@@ -552,17 +697,25 @@ async def main():
                 logger.error(f"[Client] {e}")
                 writer.close()
                 return
+
             agent.sessions[sid] = {
                 "sid": sid, "writer": writer, "buffer": {}, "exp_seq": 0,
                 "last_act": time.monotonic(), "seq_out": 0, "connecting": False,
                 "closed": False, "addr": None
             }
-            await agent.pipe_tcp_to_udp(sid, reader, agent.server_addr)
 
-        listen_host, listen_port = config["listen"]["host"], int(config["listen"]["port"])
-        server = await asyncio.start_server(handle_client, listen_host, listen_port)
+            handshake_msg = struct.pack(CMD_HDR, CMD_DATA, sid, 0)
+            if not await agent.send_via_tunnel(handshake_msg, None):
+                logger.warning(f"[Client] Handshake failed for sid={sid}, closing.")
+                await agent.close_session(sid)
+                return
+            agent.sessions[sid]["seq_out"] += 1
+
+            await agent.pipe_tcp_to_udp(sid, reader, None)
 
         await loop.create_datagram_endpoint(lambda: agent, local_addr=("0.0.0.0", 0))
+        listen_host, listen_port = config["listen"]["host"], int(config["listen"]["port"])
+        server = await asyncio.start_server(handle_client, listen_host, listen_port)
         logger.info(f"[Client] Listening on {listen_host}:{listen_port} -> Tunneling to {host}:{port}")
 
         async with server:
@@ -575,6 +728,7 @@ async def main():
         await stop_event.wait()
 
     agent.stop()
+
 
 if __name__ == "__main__":
     try:
