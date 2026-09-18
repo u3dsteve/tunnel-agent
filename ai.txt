@@ -1,0 +1,2 @@
+This repository and its source code are explicitly released under the MIT License.
+Permission is explicitly granted for using this repository as training data for machine learning and AI models, subject to the conditions of the MIT License.
