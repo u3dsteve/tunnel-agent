@@ -1,26 +1,85 @@
+# ============================================================
+# Tunnel Agent - Server Configuration
+# ============================================================
+
 # Operation role: "server"
 role: "server"
 
 # Pre-Shared Key (PSK). Must match client.
 psk: "YourSuperSecretPasswordKey2026!"
 
-# FEC parameters (Must match client)
+# ------------------------------------------------------------
+# FEC parameters
+# ------------------------------------------------------------
+# (k, m) = (data shards, parity shards). MUST match the client
+# exactly, otherwise every FEC group is dropped on receipt.
+# (4, 2) tolerates up to 33% random packet loss within a group.
 fec_k: 4
 fec_m: 2
 
-# FEC decode timeout (seconds). Increase for high-latency networks.
-# Default: 0.5
-fec_decode_timeout: 0.5
-
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
 # Logging level: "debug" | "info"
 log_level: "info"
 
+# ------------------------------------------------------------
 # Inbound UDP tunnel endpoint
+# ------------------------------------------------------------
+# Bind address for the UDP tunnel. 0.0.0.0 = all interfaces.
 tunnel:
   host: "0.0.0.0"
   port: 9999
 
+# ------------------------------------------------------------
 # Final TCP destination
+# ------------------------------------------------------------
+# Where decapsulated traffic is forwarded to. This is typically
+# a service on the server host (SSH, HTTP, a database, ...).
 target:
   host: "127.0.0.1"
   port: 22
+
+# ------------------------------------------------------------
+# Replay protection
+# ------------------------------------------------------------
+# Maximum accepted clock skew (seconds) between client and server.
+# Must be within [1.0, 300.0]. Raise this only if the two hosts
+# cannot keep their clocks aligned (e.g. broken NTP).
+timestamp_tolerance: 60.0
+
+# ------------------------------------------------------------
+# Send path tuning
+# ------------------------------------------------------------
+# Bytes buffered before flushing a CMD_DATA chunk back to the client.
+# Larger = fewer syscalls and fewer UDP packets, but higher latency
+# on idle connections. Hard limit is 8192.
+send_buffer_size: 4096
+
+# How long to wait for more TCP data before flushing the buffer.
+# Smaller = lower latency, more CPU wakeups per session.
+send_timeout: 0.02
+
+# ------------------------------------------------------------
+# Memory profile
+# ------------------------------------------------------------
+# Used to derive stream / reorder / buffer limits.
+# Does not allocate this much memory; it only scales internal caps.
+# On a server with many concurrent clients, raise this.
+available_memory_mb: 512
+
+# ------------------------------------------------------------
+# Backpressure (new)
+# ------------------------------------------------------------
+# Maximum number of in-flight FEC groups per session before the
+# agent pauses reading from the target TCP socket. This prevents
+# the "blast UDP until the kernel drops" behaviour on slow links.
+# On a server the per-session value matters less (sessions are
+# independent), but the same tuning guidance applies.
+# Lower = more conservative (better on lossy / low-bandwidth links).
+# Higher = more aggressive (better on LAN / high-bandwidth links).
+inflight_max: 512
+
+# Decay rate for the in-flight counter (groups per second).
+# Approximation of the pipe drain rate; no protocol change needed.
+inflight_decay_per_sec: 1000
