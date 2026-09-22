@@ -61,6 +61,7 @@ In network environments with high packet loss or strict stateful inspection, sta
 ```text
 PyYAML>=6.0
 cryptography>=41.0.0
+numpy>=1.21
 ```
 
 ---
